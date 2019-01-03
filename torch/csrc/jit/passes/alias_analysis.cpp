@@ -307,7 +307,7 @@ void AliasDb::analyze(Block* block) {
 
 // The basic strategy is:
 //   1. Retrieve alias information for every input.
-//   2. Use the node's schema's alias annotations to propgagate alias/write
+//   2. Use the node's schema's alias annotations to propagate alias/write
 //      information to the outputs. For unschematized nodes, a special analyzer
 //      will have to be handwritten.
 void AliasDb::analyze(Node* node) {
@@ -913,20 +913,123 @@ void AliasDb::move(Node* toMove, Node* movePoint, MoveSide moveSide) {
   }
 }
 
+c10::optional<const Node*> AliasDb::getLastWildcard() const {
+  auto it = std::max_element(
+      wildcardNodes_.cbegin(),
+      wildcardNodes_.cend(),
+      [](const Node* a, const Node* b) { return a->isBefore(b); });
+  if (it != wildcardNodes_.end()) {
+    return *it;
+  } else {
+    return c10::nullopt;
+  }
+}
+
 bool AliasDb::hasUntrackedEffects(Node* node) const {
   bool touchesWildcard = false;
-  if (!wildcardNodes_.empty()) {
-    auto lastWildcard = *wildcardNodes_.begin();
-    for (const auto wildcard : wildcardNodes_) {
-      if (wildcard->isAfter(lastWildcard)) {
-        lastWildcard = wildcard;
-      }
-    }
+  if (const auto lastWildcard = getLastWildcard()) {
     touchesWildcard = hasWrites(node) &&
-        (node->isBefore(lastWildcard) || node == lastWildcard);
+        (node->isBefore(*lastWildcard) || node == *lastWildcard);
   }
 
   return writesToInputAlias(node) || touchesWildcard;
 }
+
+c10::optional<Node*> AliasDb::deinplace(Node* node) {
+  auto name = std::string(node->kind().toQualString());
+  if (name.at(name.size() - 1) != '_') {
+    // Not an in-place op.
+    return c10::nullopt;
+  }
+
+  // Check if the node is safe to be de-inplaced:
+  // 1. No wildcard node after `node`.
+  const auto lastWildcard = getLastWildcard();
+  if (lastWildcard && (*lastWildcard)->isAfter(node)) {
+    return c10::nullopt;
+  }
+  // 2. No aliases of the output used after `node`.
+  Value* output = node->output();
+  for (const Value* v : getAliases(output)) {
+    if (v == output) {
+      continue;
+    }
+    for (const Use& u : v->uses()) {
+      if (u.user->isAfter(node)) {
+        return c10::nullopt;
+      }
+    }
+  }
+
+  // Replace the in-place node with the out-of-place equivalent.
+  WithInsertPoint insert_guard{node};
+  name.pop_back(); // Remove the underscore
+  Graph* graph = node->owningGraph();
+  Node* deinplaced = graph->insertNode(
+      graph->create(Symbol::fromQualString(name), node->inputs()));
+  Value* deinplacedOutput = deinplaced->output();
+  node->output()->replaceAllUsesWith(deinplacedOutput);
+
+  // Remove from the alias db.
+  erase(node);
+  node->destroy();
+
+  // Add the new node to the alias db.
+  insert(deinplaced);
+  return deinplaced;
+}
+
+void AliasDb::erase(Node* n) {
+  // We should only erase unused nodes
+  for (const auto output : n->outputs()) {
+    JIT_ASSERT(output->uses().size() == 0);
+  }
+
+  // Only support schematized nodes for now. If/loop will require special
+  // handling for inner blocks
+  JIT_ASSERT(n->maybeSchema());
+
+  std::unordered_set<const Value*> allValues;
+  for (const auto v : n->inputs()) {
+    allValues.insert(v);
+  }
+  for (const auto v : n->outputs()) {
+    allValues.insert(v);
+  }
+
+  // Get the union of all the alias sets that `n` uses
+  AliasInfo allSets;
+  for (const auto v : allValues) {
+    if (valueToAlias_.count(v)) {
+      allSets.unionWith(valueToAlias_.at(v));
+      valueToAlias_.erase(v);
+    }
+  }
+
+  for (const auto set : allSets.sets()) {
+    auto& values = aliasToValue_.at(set);
+    for (auto it = values.begin(); it != values.end();) {
+      if (allValues.count(*it)) {
+        it = values.erase(it);
+      } else {
+        ++it;
+      }
+    }
+
+    if (aliasToWrites_.count(set)) {
+      aliasToWrites_.at(set).erase(n);
+    }
+  }
+
+  if (wildcardNodes_.count(n)) {
+    wildcardNodes_.erase(n);
+  }
+}
+
+void AliasDb::insert(Node* n) {
+  analyze(n);
+  // TODO update other indices.
+}
+
 } // namespace jit
 } // namespace torch

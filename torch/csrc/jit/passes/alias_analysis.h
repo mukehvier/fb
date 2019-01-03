@@ -71,6 +71,14 @@ class AliasDb {
   bool couldMoveAfterTopologically(Node* n, Node* movePoint);
   bool couldMoveBeforeTopologically(Node* n, Node* movePoint);
 
+  // De-inplace this node, turning it into a pure operator (e.g. add_ -> add)
+  // and rewriting subsequent uses of `n`'s output to use the result.
+  // De-inplacing may fail if we can't prove that it's safe.
+  //
+  // Returns the new deinplaced node, or nullopt if the de-inplacing was not
+  // possible.
+  c10::optional<Node*> deinplace(Node* n);
+
   // For debugging: print alias db state to stdout
   void dump() const;
 
@@ -82,8 +90,16 @@ class AliasDb {
   void move(Node* movePoint, Node* toMove, MoveSide moveSide);
   bool isBeforeOrAfter(const Node* n, MoveSide moveSide) const;
 
+  // Insert `n` and its values into the db
+  void insert(Node* n);
+
+  // Erase `n` and its values from the db
+  void erase(Node* n);
+
   // Does `n` use or write to any wildcard aliases?
   bool hasWildcard(const Node* n) const;
+  // Returns nullopt if there are no wildcard nodes
+  c10::optional<const Node*> getLastWildcard() const;
 
   // Does `n` write to a value that may alias one of the graph inputs?
   bool writesToInputAlias(Node* n) const;
